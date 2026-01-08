@@ -158,6 +158,8 @@ type MigrationContext struct {
 	PanicOnWarnings                     bool
 	Checkpoint                          bool
 	CheckpointIntervalSeconds           int64
+	AllowChildForeignKeys               bool
+	ForeignKeyRenamePrefix              string
 
 	DropServeSocket bool
 	ServeSocketFile string
