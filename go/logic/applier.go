@@ -545,7 +545,24 @@ func (this *Applier) dropTable(tableName string) error {
 }
 
 func (this *Applier) StateMetadataLockInstrument() error {
-	query := `select /*+ MAX_EXECUTION_TIME(300) */ ENABLED, TIMED from performance_schema.setup_instruments WHERE NAME = 'wait/lock/metadata/sql/mdl'`
+	// Check if performance_schema is enabled first
+	var performanceSchemaValue string
+	query := `SHOW VARIABLES LIKE 'performance_schema'`
+	if err := this.db.QueryRow(query).Scan(new(string), &performanceSchemaValue); err != nil {
+		return this.migrationContext.Log.Errorf("Unable to determine performance_schema status: %s", err)
+	}
+
+	if !strings.EqualFold(performanceSchemaValue, "ON") {
+		this.migrationContext.Log.Warningf("performance_schema is disabled (value: %s)", performanceSchemaValue)
+		if this.migrationContext.AllowDisabledMetadataLockInstruments {
+			this.migrationContext.Log.Warningf("AllowDisabledMetadataLockInstruments is enabled, proceeding without metadata lock instrumentation")
+			this.migrationContext.IsOpenMetadataLockInstruments = false
+			return nil
+		}
+		return this.migrationContext.Log.Errorf("performance_schema is disabled. Please enable it or use --allow-disabled-metadata-lock-instruments to proceed without metadata lock checking")
+	}
+
+	query = `select /*+ MAX_EXECUTION_TIME(300) */ ENABLED, TIMED from performance_schema.setup_instruments WHERE NAME = 'wait/lock/metadata/sql/mdl'`
 	var enabled, timed string
 	if err := this.db.QueryRow(query).Scan(&enabled, &timed); err != nil {
 		return this.migrationContext.Log.Errorf("query performance_schema.setup_instruments with name wait/lock/metadata/sql/mdl error: %s", err)

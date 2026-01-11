@@ -143,6 +143,9 @@ func main() {
 	flag.BoolVar(&migrationContext.AllowSetupMetadataLockInstruments, "allow-setup-metadata-lock-instruments", false, "validate rename session hold the MDL of original table before unlock tables in cut-over phase")
 	flag.IntVar(&migrationContext.BinlogSyncerMaxReconnectAttempts, "binlogsyncer-max-reconnect-attempts", 0, "when master node fails, the maximum number of binlog synchronization attempts to reconnect. 0 is unlimited")
 
+	flag.BoolVar(&migrationContext.AllowDisabledMetadataLockInstruments, "allow-disabled-metadata-lock-instruments", false, "allow disabled metadata lock instruments")
+	flag.IntVar(&migrationContext.CustomZLength, "custom-z-length", 0, "custom z name length")
+
 	flag.BoolVar(&migrationContext.IncludeTriggers, "include-triggers", false, "When true, the triggers (if exist) will be created on the new table")
 	flag.StringVar(&migrationContext.TriggerSuffix, "trigger-suffix", "", "Add a suffix to the trigger name (i.e '_v2'). Requires '--include-triggers'")
 	flag.BoolVar(&migrationContext.RemoveTriggerSuffix, "remove-trigger-suffix-if-exists", false, "Remove given suffix from name of trigger. Requires '--include-triggers' and '--trigger-suffix'")
@@ -371,6 +374,10 @@ func main() {
 	}
 	if err := migrationContext.SetExponentialBackoffMaxInterval(*exponentialBackoffMaxInterval); err != nil {
 		migrationContext.Log.Errore(err)
+	}
+
+	if migrationContext.CustomZLength > 0 {
+		base.CustomZLength = migrationContext.CustomZLength
 	}
 
 	log.Infof("starting gh-ost %+v (git commit: %s)", AppVersion, GitCommit)
