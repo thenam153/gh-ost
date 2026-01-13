@@ -390,6 +390,12 @@ func (this *Inspector) validateBinlogs() error {
 		return err
 	}
 	if !hasBinaryLogs {
+		// For Aurora readers without binary logs, allow if --assume-master-host is set
+		if this.migrationContext.AssumeMasterHostname != "" {
+			this.migrationContext.Log.Warningf("%s doesn't have binary logs, but --assume-master-host is set. Assuming master has binary logs.", this.connectionConfig.Key.String())
+			this.migrationContext.OriginalBinlogFormat = "ROW"
+			return nil
+		}
 		return fmt.Errorf("%s must have binary logs enabled", this.connectionConfig.Key.String())
 	}
 	if this.migrationContext.RequiresBinlogFormatChange() {
@@ -463,6 +469,12 @@ func (this *Inspector) validateLogSlaveUpdates() error {
 
 	if this.migrationContext.InspectorIsAlsoApplier() {
 		this.migrationContext.Log.Warningf("log_slave_updates not found on %s, but executing directly on master, so I'm proceeding", this.connectionConfig.Key.String())
+		return nil
+	}
+
+	// For Aurora readers without log_slave_updates, allow if --assume-master-host is set
+	if this.migrationContext.AssumeMasterHostname != "" {
+		this.migrationContext.Log.Warningf("log_slave_updates not found on %s, but --assume-master-host is set. Binlog events will be read from master.", this.connectionConfig.Key.String())
 		return nil
 	}
 
