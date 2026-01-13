@@ -48,8 +48,20 @@ type EventsStreamer struct {
 }
 
 func NewEventsStreamer(migrationContext *base.MigrationContext) *EventsStreamer {
+	// Use Applier connection (master) for binlog streaming if --assume-master-host is set
+	// This is needed for Aurora readers that don't have their own binary logs
+	connectionConfig := migrationContext.InspectorConnectionConfig
+	
+	// If --assume-master-host is provided and ApplierConnectionConfig is set, use it for streaming
+	if migrationContext.AssumeMasterHostname != "" && migrationContext.ApplierConnectionConfig != nil {
+		migrationContext.Log.Infof("Using master connection for binlog streaming (--assume-master-host is set)")
+		connectionConfig = migrationContext.ApplierConnectionConfig
+	} else {
+		migrationContext.Log.Infof("Using inspector connection for binlog streaming")
+	}
+	
 	return &EventsStreamer{
-		connectionConfig:         migrationContext.InspectorConnectionConfig,
+		connectionConfig:         connectionConfig,
 		migrationContext:         migrationContext,
 		listeners:                [](*BinlogEventListener){},
 		listenersMutex:           &sync.Mutex{},

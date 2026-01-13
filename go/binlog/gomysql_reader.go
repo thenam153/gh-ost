@@ -34,7 +34,14 @@ type GoMySQLReader struct {
 }
 
 func NewGoMySQLReader(migrationContext *base.MigrationContext) *GoMySQLReader {
+	// Use Applier connection (master) for binlog reading if --assume-master-host is set
+	// This is needed for Aurora readers that don't have their own binary logs
 	connectionConfig := migrationContext.InspectorConnectionConfig
+	if migrationContext.AssumeMasterHostname != "" && migrationContext.ApplierConnectionConfig != nil {
+		migrationContext.Log.Infof("GoMySQLReader: Using master connection for binlog reading (--assume-master-host is set)")
+		connectionConfig = migrationContext.ApplierConnectionConfig
+	}
+	
 	return &GoMySQLReader{
 		migrationContext:        migrationContext,
 		connectionConfig:        connectionConfig,
