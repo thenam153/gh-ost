@@ -1349,9 +1349,11 @@ func (this *Migrator) initiateApplier() error {
 			this.migrationContext.Log.Errorf("Unable to create ghost table, see further error details. Perhaps a previous migration failed without dropping the table? Bailing out")
 			return err
 		}
-		if err := this.applier.ApplyForeignKeys(); err != nil {
-			this.migrationContext.Log.Errorf("Unable to apply foreign keys, see further error details. Bailing out")
-			return err
+		if this.migrationContext.AllowChildForeignKeys {
+			if err := this.applier.ApplyForeignKeys(); err != nil {
+				this.migrationContext.Log.Errorf("Unable to apply foreign keys, see further error details. Bailing out")
+				return err
+			}
 		}
 		if err := this.applier.AlterGhost(); err != nil {
 			this.migrationContext.Log.Errorf("Unable to ALTER ghost table, see further error details. Bailing out")
