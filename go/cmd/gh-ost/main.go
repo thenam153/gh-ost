@@ -219,6 +219,10 @@ func main() {
 	parser := sql.NewParserFromAlterStatement(migrationContext.AlterStatement)
 	migrationContext.AlterStatementOptions = parser.GetAlterStatementOptions()
 
+	if migrationContext.AllowChildForeignKeys && migrationContext.DiscardForeignKeys {
+		log.Fatal("--allow-child-foreign-keys cannot be used with --discard-foreign-keys")
+	}
+
 	if migrationContext.Revert {
 		if migrationContext.Resume {
 			log.Fatal("--revert cannot be used with --resume")
