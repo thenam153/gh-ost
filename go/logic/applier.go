@@ -1566,6 +1566,11 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 
 		sessionQuery := "SET /* gh-ost */ SESSION time_zone = '+00:00'"
 		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
+
+		if this.migrationContext.AcceptHighRiskOrphanedForeignKeys {
+			sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, "foreign_key_checks = 0")
+		}
+
 		if _, err := conn.ExecContext(ctx, sessionQuery); err != nil {
 			return err
 		}

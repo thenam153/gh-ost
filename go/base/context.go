@@ -161,6 +161,8 @@ type MigrationContext struct {
 	AllowChildForeignKeys               bool
 	ForeignKeyRenamePrefix              string
 
+	AcceptHighRiskOrphanedForeignKeys bool
+
 	DropServeSocket bool
 	ServeSocketFile string
 	ServeTCPPort    int64
