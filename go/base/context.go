@@ -162,6 +162,7 @@ type MigrationContext struct {
 	ForeignKeyRenamePrefix              string
 
 	AcceptHighRiskOrphanedForeignKeys bool
+	FKFallbackEnabled                 bool // Enable FK fallback: query original table on FK error
 
 	DropServeSocket bool
 	ServeSocketFile string
