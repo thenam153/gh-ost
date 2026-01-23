@@ -161,6 +161,9 @@ type MigrationContext struct {
 	AllowChildForeignKeys               bool
 	ForeignKeyRenamePrefix              string
 
+	AcceptHighRiskOrphanedForeignKeys bool
+	FKFallbackEnabled                 bool // Enable FK fallback: query original table on FK error
+
 	DropServeSocket bool
 	ServeSocketFile string
 	ServeTCPPort    int64

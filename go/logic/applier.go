@@ -37,6 +37,24 @@ const (
 // ErrNoCheckpointFound is returned when an empty checkpoint table is queried.
 var ErrNoCheckpointFound = errors.New("no checkpoint found in _ghk table")
 
+// MySQL error codes for foreign key constraints
+const (
+	MySQLErrFKConstraintFails   = 1452 // Cannot add or update a child row: a foreign key constraint fails
+	MySQLErrFKConstrParentFails = 1451 // Cannot delete or update a parent row: a foreign key constraint fails
+)
+
+// isForeignKeyError checks if the error is a MySQL foreign key constraint error
+func isForeignKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var mysqlErr *drivermysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number == MySQLErrFKConstraintFails || mysqlErr.Number == MySQLErrFKConstrParentFails
+	}
+	return false
+}
+
 type dmlBuildResult struct {
 	query     string
 	args      []interface{}
@@ -83,6 +101,10 @@ type Applier struct {
 	dmlInsertQueryBuilder        *sql.DMLInsertQueryBuilder
 	dmlUpdateQueryBuilder        *sql.DMLUpdateQueryBuilder
 	checkpointInsertQueryBuilder *sql.CheckpointInsertQueryBuilder
+
+	// FK fallback: track PKs that had FK errors and need special handling
+	fkTrackedPKs    map[string]bool // Key: serialized PK values
+	fkTrackedPKsMux sync.RWMutex    // Mutex for concurrent access
 }
 
 func NewApplier(migrationContext *base.MigrationContext) *Applier {
@@ -91,6 +113,7 @@ func NewApplier(migrationContext *base.MigrationContext) *Applier {
 		migrationContext:  migrationContext,
 		finishedMigrating: 0,
 		name:              "applier",
+		fkTrackedPKs:      make(map[string]bool),
 	}
 }
 
@@ -1553,98 +1576,506 @@ func (this *Applier) buildDMLEventQuery(dmlEvent *binlog.BinlogDMLEvent) []*dmlB
 }
 
 // ApplyDMLEventQueries applies multiple DML queries onto the _ghost_ table
-func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) error {
+// Maintains binlog order: builds multi-statement query with all events in sequence
+func (this *Applier) ApplyDMLEventQueries(dmlEvents []*binlog.BinlogDMLEvent) error {
 	var totalDelta int64
+	var err error
 	ctx := context.Background()
 
-	err := func() error {
-		conn, err := this.db.Conn(ctx)
-		if err != nil {
-			return err
+	// Try batch execution first (normal path - no tracked PKs)
+	hasTrackedPKs := false
+	for _, dmlEvent := range dmlEvents {
+		pkKey := this.serializePKValues(dmlEvent)
+		if this.isFKTrackedPK(pkKey) && dmlEvent.DML != binlog.DeleteDML {
+			hasTrackedPKs = true
+			break
 		}
-		defer conn.Close()
+	}
 
-		sessionQuery := "SET /* gh-ost */ SESSION time_zone = '+00:00'"
-		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
-		if _, err := conn.ExecContext(ctx, sessionQuery); err != nil {
-			return err
-		}
-
-		tx, err := conn.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		rollback := func(err error) error {
-			tx.Rollback()
-			return err
-		}
-
-		buildResults := make([]*dmlBuildResult, 0, len(dmlEvents))
-		nArgs := 0
-		for _, dmlEvent := range dmlEvents {
-			for _, buildResult := range this.buildDMLEventQuery(dmlEvent) {
-				if buildResult.err != nil {
-					return rollback(buildResult.err)
-				}
-				nArgs += len(buildResult.args)
-				buildResults = append(buildResults, buildResult)
-			}
-		}
-
-		// We batch together the DML queries into multi-statements to minimize network trips.
-		// We have to use the raw driver connection to access the rows affected
-		// for each statement in the multi-statement.
-		execErr := conn.Raw(func(driverConn any) error {
-			ex := driverConn.(driver.ExecerContext)
-			nvc := driverConn.(driver.NamedValueChecker)
-
-			multiArgs := make([]driver.NamedValue, 0, nArgs)
-			multiQueryBuilder := strings.Builder{}
-			for _, buildResult := range buildResults {
-				for _, arg := range buildResult.args {
-					nv := driver.NamedValue{Value: driver.Value(arg)}
-					nvc.CheckNamedValue(&nv)
-					multiArgs = append(multiArgs, nv)
-				}
-
-				multiQueryBuilder.WriteString(buildResult.query)
-				multiQueryBuilder.WriteString(";\n")
-			}
-
-			res, err := ex.ExecContext(ctx, multiQueryBuilder.String(), multiArgs)
-			if err != nil {
-				err = fmt.Errorf("%w; query=%s; args=%+v", err, multiQueryBuilder.String(), multiArgs)
-				return err
-			}
-
-			mysqlRes := res.(drivermysql.Result)
-
-			// each DML is either a single insert (delta +1), update (delta +0) or delete (delta -1).
-			// multiplying by the rows actually affected (either 0 or 1) will give an accurate row delta for this DML event
-			for i, rowsAffected := range mysqlRes.AllRowsAffected() {
-				totalDelta += buildResults[i].rowsDelta * rowsAffected
-			}
-			return nil
-		})
-
-		if execErr != nil {
-			return rollback(execErr)
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-		return nil
-	}()
+	if !hasTrackedPKs {
+		// Fast path: no tracked PKs, use normal batch execution
+		err = this.executeDMLEvents(ctx, dmlEvents, &totalDelta)
+	} else {
+		// Has tracked PKs: use ordered multi-statement to maintain binlog sequence
+		err = this.applyEventsOrderedMultiStatement(ctx, dmlEvents, &totalDelta)
+	}
 
 	if err != nil {
-		return this.migrationContext.Log.Errore(err)
+		if isForeignKeyError(err) && this.migrationContext.FKFallbackEnabled {
+			// FK error - fallback to ordered multi-statement with FK handling
+			this.migrationContext.Log.Warningf("Batch DML failed with FK error, falling back to ordered multi-statement: %v", err)
+			totalDelta = 0 // Reset delta before fallback
+			err = this.applyEventsWithFKFallback(ctx, dmlEvents, &totalDelta)
+			if err != nil {
+				return this.migrationContext.Log.Errore(err)
+			}
+		} else {
+			return this.migrationContext.Log.Errore(err)
+		}
 	}
-	// no error
+
 	atomic.AddInt64(&this.migrationContext.TotalDMLEventsApplied, int64(len(dmlEvents)))
 	if this.migrationContext.CountTableRows {
 		atomic.AddInt64(&this.migrationContext.RowsDeltaEstimate, totalDelta)
 	}
-	this.migrationContext.Log.Debugf("ApplyDMLEventQueries() applied %d events in one transaction", len(dmlEvents))
+	this.migrationContext.Log.Debugf("ApplyDMLEventQueries() applied %d events", len(dmlEvents))
+	return nil
+}
+
+// applyEventsOrderedMultiStatement builds a multi-statement query maintaining binlog order
+// Tracked PKs use INSERT...SELECT FROM original, others use normal DML
+func (this *Applier) applyEventsOrderedMultiStatement(ctx context.Context, dmlEvents []*binlog.BinlogDMLEvent, totalDelta *int64) error {
+	conn, err := this.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Set session variables
+	sessionQuery := "SET /* gh-ost */ SESSION time_zone = '+00:00'"
+	sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
+	if this.migrationContext.AcceptHighRiskOrphanedForeignKeys {
+		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, "foreign_key_checks = 0")
+	}
+	if _, err := conn.ExecContext(ctx, sessionQuery); err != nil {
+		return err
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(err error) error {
+		tx.Rollback()
+		return err
+	}
+
+	// Build multi-statement query maintaining order
+	var queryBuilder strings.Builder
+	var allArgs []interface{}
+	buildResults := make([]*dmlBuildResult, 0, len(dmlEvents))
+
+	for _, dmlEvent := range dmlEvents {
+		pkKey := this.serializePKValues(dmlEvent)
+		isTracked := this.isFKTrackedPK(pkKey) && dmlEvent.DML != binlog.DeleteDML
+
+		if isTracked {
+			// Tracked PK: use INSERT...SELECT FROM original table
+			query, args := this.buildInsertSelectFromOriginal(dmlEvent)
+			queryBuilder.WriteString(query)
+			queryBuilder.WriteString(";\n")
+			allArgs = append(allArgs, args...)
+			// INSERT has rowsDelta of 1
+			buildResults = append(buildResults, newDmlBuildResult(query, args, 1, nil))
+		} else {
+			// Normal event: use standard DML
+			for _, buildResult := range this.buildDMLEventQuery(dmlEvent) {
+				if buildResult.err != nil {
+					return buildResult.err
+				}
+				queryBuilder.WriteString(buildResult.query)
+				queryBuilder.WriteString(";\n")
+				allArgs = append(allArgs, buildResult.args...)
+				buildResults = append(buildResults, buildResult)
+			}
+		}
+	}
+
+	// Execute multi-statement
+	execErr := conn.Raw(func(driverConn any) error {
+		ex := driverConn.(driver.ExecerContext)
+		nvc := driverConn.(driver.NamedValueChecker)
+
+		namedArgs := make([]driver.NamedValue, 0, len(allArgs))
+		for _, arg := range allArgs {
+			nv := driver.NamedValue{Value: driver.Value(arg)}
+			nvc.CheckNamedValue(&nv)
+			namedArgs = append(namedArgs, nv)
+		}
+
+		res, err := ex.ExecContext(ctx, queryBuilder.String(), namedArgs)
+		if err != nil {
+			return fmt.Errorf("%w; query=%s", err, queryBuilder.String())
+		}
+
+		mysqlRes := res.(drivermysql.Result)
+		for i, rowsAffected := range mysqlRes.AllRowsAffected() {
+			*totalDelta += buildResults[i].rowsDelta * rowsAffected
+		}
+		return nil
+	})
+
+	if execErr != nil {
+		return rollback(execErr)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	this.migrationContext.Log.Debugf("applyEventsOrderedMultiStatement: applied %d events, delta=%d", len(dmlEvents), *totalDelta)
+	return nil
+}
+
+// buildInsertSelectFromOriginal builds INSERT...SELECT query for tracked PK
+func (this *Applier) buildInsertSelectFromOriginal(dmlEvent *binlog.BinlogDMLEvent) (string, []interface{}) {
+	var whereValues *sql.ColumnValues
+	if dmlEvent.WhereColumnValues != nil {
+		whereValues = dmlEvent.WhereColumnValues
+	} else {
+		whereValues = dmlEvent.NewColumnValues
+	}
+
+	query := fmt.Sprintf(`
+		INSERT /* gh-ost */ INTO %s.%s (%s)
+		SELECT %s FROM %s.%s WHERE %s
+		ON DUPLICATE KEY UPDATE %s
+	`,
+		sql.EscapeName(this.migrationContext.DatabaseName),
+		sql.EscapeName(this.migrationContext.GetGhostTableName()),
+		strings.Join(this.migrationContext.SharedColumns.Names(), ", "),
+		strings.Join(this.migrationContext.MappedSharedColumns.Names(), ", "),
+		sql.EscapeName(this.migrationContext.DatabaseName),
+		sql.EscapeName(this.migrationContext.OriginalTableName),
+		this.buildUniqueKeyWhereClause(),
+		this.buildOnDuplicateUpdateClause(),
+	)
+
+	args := make([]interface{}, 0, this.migrationContext.UniqueKey.Len())
+	for _, col := range this.migrationContext.UniqueKey.Columns.Columns() {
+		ordinal := this.migrationContext.OriginalTableColumns.Ordinals[col.Name]
+		args = append(args, whereValues.AbstractValues()[ordinal])
+	}
+
+	return query, args
+}
+
+// applyEventsWithFKFallback processes events one by one when batch fails with FK error
+func (this *Applier) applyEventsWithFKFallback(ctx context.Context, dmlEvents []*binlog.BinlogDMLEvent, totalDelta *int64) error {
+	for _, dmlEvent := range dmlEvents {
+		var eventDelta int64
+		pkKey := this.serializePKValues(dmlEvent)
+
+		err := this.executeDMLEvents(ctx, []*binlog.BinlogDMLEvent{dmlEvent}, &eventDelta)
+		if err != nil {
+			if isForeignKeyError(err) {
+				// FK error - apply via original table and track PK
+				this.migrationContext.Log.Debugf("FK error for event, applying via original table")
+				err = this.applyViaOriginalTable(ctx, dmlEvent, &eventDelta)
+				if err != nil {
+					return err
+				}
+				this.addFKTrackedPK(pkKey)
+			} else {
+				return err
+			}
+		}
+		*totalDelta += eventDelta
+	}
+	return nil
+}
+
+// batchApplyViaOriginalTable applies multiple tracked events via original table in batch
+func (this *Applier) batchApplyViaOriginalTable(ctx context.Context, dmlEvents []*binlog.BinlogDMLEvent) (int64, error) {
+	if len(dmlEvents) == 0 {
+		return 0, nil
+	}
+
+	var totalDelta int64
+	conn, err := this.db.Conn(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+
+	// Set session variables once for all queries
+	sessionQuery := "SET /* gh-ost */ SESSION time_zone = '+00:00'"
+	sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
+	if this.migrationContext.AcceptHighRiskOrphanedForeignKeys {
+		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, "foreign_key_checks = 0")
+	}
+	if _, err := conn.ExecContext(ctx, sessionQuery); err != nil {
+		return 0, err
+	}
+
+	// Build batch query using UNION ALL for multiple rows
+	whereClause := this.buildUniqueKeyWhereClause()
+	sharedCols := strings.Join(this.migrationContext.SharedColumns.Names(), ", ")
+	mappedCols := strings.Join(this.migrationContext.MappedSharedColumns.Names(), ", ")
+	onDuplicateClause := this.buildOnDuplicateUpdateClause()
+
+	// Build multi-row INSERT ... SELECT ... UNION ALL SELECT ...
+	var queryBuilder strings.Builder
+	var allArgs []interface{}
+
+	queryBuilder.WriteString(fmt.Sprintf(`
+		INSERT /* gh-ost */ INTO %s.%s (%s)
+		SELECT * FROM (
+	`,
+		sql.EscapeName(this.migrationContext.DatabaseName),
+		sql.EscapeName(this.migrationContext.GetGhostTableName()),
+		sharedCols,
+	))
+
+	for i, dmlEvent := range dmlEvents {
+		if dmlEvent.DML == binlog.DeleteDML {
+			// Handle DELETE separately
+			var delDelta int64
+			if err := this.executeDMLEvents(ctx, []*binlog.BinlogDMLEvent{dmlEvent}, &delDelta); err != nil {
+				return totalDelta, err
+			}
+			totalDelta += delDelta
+			continue
+		}
+
+		var whereValues *sql.ColumnValues
+		if dmlEvent.WhereColumnValues != nil {
+			whereValues = dmlEvent.WhereColumnValues
+		} else {
+			whereValues = dmlEvent.NewColumnValues
+		}
+
+		if i > 0 {
+			queryBuilder.WriteString(" UNION ALL ")
+		}
+		queryBuilder.WriteString(fmt.Sprintf(`
+			SELECT %s FROM %s.%s WHERE %s
+		`,
+			mappedCols,
+			sql.EscapeName(this.migrationContext.DatabaseName),
+			sql.EscapeName(this.migrationContext.OriginalTableName),
+			whereClause,
+		))
+
+		// Add args for this event's WHERE clause
+		for _, col := range this.migrationContext.UniqueKey.Columns.Columns() {
+			ordinal := this.migrationContext.OriginalTableColumns.Ordinals[col.Name]
+			allArgs = append(allArgs, whereValues.AbstractValues()[ordinal])
+		}
+	}
+
+	if len(allArgs) == 0 {
+		// All events were DELETEs, already processed
+		return totalDelta, nil
+	}
+
+	queryBuilder.WriteString(fmt.Sprintf(`
+		) AS src
+		ON DUPLICATE KEY UPDATE %s
+	`, onDuplicateClause))
+
+	result, err := conn.ExecContext(ctx, queryBuilder.String(), allArgs...)
+	if err != nil {
+		return totalDelta, fmt.Errorf("batchApplyViaOriginalTable: %w; args_count=%d", err, len(allArgs))
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	totalDelta += rowsAffected
+
+	this.migrationContext.Log.Debugf("batchApplyViaOriginalTable: affected %d rows for %d events", rowsAffected, len(dmlEvents))
+	return totalDelta, nil
+}
+
+// serializePKValues creates a string key from the unique key values of a DML event
+func (this *Applier) serializePKValues(dmlEvent *binlog.BinlogDMLEvent) string {
+	var values *sql.ColumnValues
+	if dmlEvent.WhereColumnValues != nil {
+		values = dmlEvent.WhereColumnValues
+	} else if dmlEvent.NewColumnValues != nil {
+		values = dmlEvent.NewColumnValues
+	}
+	if values == nil {
+		return ""
+	}
+
+	// Extract unique key column values
+	pkValues := make([]interface{}, 0, this.migrationContext.UniqueKey.Len())
+	for _, col := range this.migrationContext.UniqueKey.Columns.Columns() {
+		ordinal := this.migrationContext.OriginalTableColumns.Ordinals[col.Name]
+		pkValues = append(pkValues, values.AbstractValues()[ordinal])
+	}
+	return fmt.Sprintf("%v", pkValues)
+}
+
+// isFKTrackedPK checks if a PK is in the tracked set
+func (this *Applier) isFKTrackedPK(pkKey string) bool {
+	this.fkTrackedPKsMux.RLock()
+	defer this.fkTrackedPKsMux.RUnlock()
+	return this.fkTrackedPKs[pkKey]
+}
+
+// addFKTrackedPK adds a PK to the tracked set
+func (this *Applier) addFKTrackedPK(pkKey string) {
+	this.fkTrackedPKsMux.Lock()
+	defer this.fkTrackedPKsMux.Unlock()
+	this.fkTrackedPKs[pkKey] = true
+	this.migrationContext.Log.Debugf("FK tracked PK added: %s (total: %d)", pkKey, len(this.fkTrackedPKs))
+}
+
+// applyViaOriginalTable queries the original table and applies data via INSERT ON DUPLICATE KEY UPDATE
+func (this *Applier) applyViaOriginalTable(ctx context.Context, dmlEvent *binlog.BinlogDMLEvent, eventDelta *int64) error {
+	if dmlEvent.DML == binlog.DeleteDML {
+		// For DELETE, just apply normally
+		return this.executeDMLEvents(ctx, []*binlog.BinlogDMLEvent{dmlEvent}, eventDelta)
+	}
+
+	// Build WHERE clause from unique key values
+	var whereValues *sql.ColumnValues
+	if dmlEvent.WhereColumnValues != nil {
+		whereValues = dmlEvent.WhereColumnValues
+	} else {
+		whereValues = dmlEvent.NewColumnValues
+	}
+
+	// Query original table for current data
+	query := fmt.Sprintf(`
+		INSERT /* gh-ost */ INTO %s.%s (%s)
+		SELECT %s FROM %s.%s
+		WHERE %s
+		ON DUPLICATE KEY UPDATE %s
+	`,
+		sql.EscapeName(this.migrationContext.DatabaseName),
+		sql.EscapeName(this.migrationContext.GetGhostTableName()),
+		strings.Join(this.migrationContext.SharedColumns.Names(), ", "),
+		strings.Join(this.migrationContext.MappedSharedColumns.Names(), ", "),
+		sql.EscapeName(this.migrationContext.DatabaseName),
+		sql.EscapeName(this.migrationContext.OriginalTableName),
+		this.buildUniqueKeyWhereClause(),
+		this.buildOnDuplicateUpdateClause(),
+	)
+
+	// Build arguments from unique key values
+	args := make([]interface{}, 0, this.migrationContext.UniqueKey.Len())
+	for _, col := range this.migrationContext.UniqueKey.Columns.Columns() {
+		ordinal := this.migrationContext.OriginalTableColumns.Ordinals[col.Name]
+		args = append(args, whereValues.AbstractValues()[ordinal])
+	}
+
+	conn, err := this.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	sessionQuery := "SET /* gh-ost */ SESSION time_zone = '+00:00'"
+	sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
+	if this.migrationContext.AcceptHighRiskOrphanedForeignKeys {
+		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, "foreign_key_checks = 0")
+	}
+
+	if _, err := conn.ExecContext(ctx, sessionQuery); err != nil {
+		return err
+	}
+
+	result, err := conn.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("applyViaOriginalTable: %w; query=%s; args=%v", err, query, args)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if dmlEvent.DML == binlog.InsertDML {
+		*eventDelta += rowsAffected
+	}
+
+	this.migrationContext.Log.Debugf("applyViaOriginalTable: affected %d rows", rowsAffected)
+	return nil
+}
+
+// buildUniqueKeyWhereClause builds WHERE clause for unique key columns
+func (this *Applier) buildUniqueKeyWhereClause() string {
+	clauses := make([]string, 0, this.migrationContext.UniqueKey.Len())
+	for _, col := range this.migrationContext.UniqueKey.Columns.Columns() {
+		clauses = append(clauses, fmt.Sprintf("%s = ?", sql.EscapeName(col.Name)))
+	}
+	return strings.Join(clauses, " AND ")
+}
+
+// buildOnDuplicateUpdateClause builds ON DUPLICATE KEY UPDATE clause
+func (this *Applier) buildOnDuplicateUpdateClause() string {
+	clauses := make([]string, 0, this.migrationContext.SharedColumns.Len())
+	for _, colName := range this.migrationContext.SharedColumns.Names() {
+		clauses = append(clauses, fmt.Sprintf("%s = VALUES(%s)", sql.EscapeName(colName), sql.EscapeName(colName)))
+	}
+	return strings.Join(clauses, ", ")
+}
+
+// executeDMLEvents executes DML events in a single transaction
+func (this *Applier) executeDMLEvents(ctx context.Context, dmlEvents []*binlog.BinlogDMLEvent, totalDelta *int64) error {
+	conn, err := this.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	sessionQuery := "SET /* gh-ost */ SESSION time_zone = '+00:00'"
+	sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
+
+	if this.migrationContext.AcceptHighRiskOrphanedForeignKeys {
+		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, "foreign_key_checks = 0")
+	}
+
+	if _, err := conn.ExecContext(ctx, sessionQuery); err != nil {
+		return err
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(err error) error {
+		tx.Rollback()
+		return err
+	}
+
+	buildResults := make([]*dmlBuildResult, 0, len(dmlEvents))
+	nArgs := 0
+	for _, dmlEvent := range dmlEvents {
+		for _, buildResult := range this.buildDMLEventQuery(dmlEvent) {
+			if buildResult.err != nil {
+				return rollback(buildResult.err)
+			}
+			nArgs += len(buildResult.args)
+			buildResults = append(buildResults, buildResult)
+		}
+	}
+
+	// We batch together the DML queries into multi-statements to minimize network trips.
+	execErr := conn.Raw(func(driverConn any) error {
+		ex := driverConn.(driver.ExecerContext)
+		nvc := driverConn.(driver.NamedValueChecker)
+
+		multiArgs := make([]driver.NamedValue, 0, nArgs)
+		multiQueryBuilder := strings.Builder{}
+		for _, buildResult := range buildResults {
+			for _, arg := range buildResult.args {
+				nv := driver.NamedValue{Value: driver.Value(arg)}
+				nvc.CheckNamedValue(&nv)
+				multiArgs = append(multiArgs, nv)
+			}
+
+			multiQueryBuilder.WriteString(buildResult.query)
+			multiQueryBuilder.WriteString(";\n")
+		}
+
+		res, err := ex.ExecContext(ctx, multiQueryBuilder.String(), multiArgs)
+		if err != nil {
+			err = fmt.Errorf("%w; query=%s; args=%+v", err, multiQueryBuilder.String(), multiArgs)
+			return err
+		}
+
+		mysqlRes := res.(drivermysql.Result)
+
+		for i, rowsAffected := range mysqlRes.AllRowsAffected() {
+			*totalDelta += buildResults[i].rowsDelta * rowsAffected
+		}
+		return nil
+	})
+
+	if execErr != nil {
+		return rollback(execErr)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	return nil
 }
 

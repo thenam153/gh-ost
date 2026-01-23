@@ -83,6 +83,10 @@ func main() {
 	flag.BoolVar(&migrationContext.DiscardForeignKeys, "discard-foreign-keys", false, "DANGER! This flag will migrate a table that has foreign keys and will NOT create foreign keys on the ghost table, thus your altered table will have NO foreign keys. This is useful for intentional dropping of foreign keys")
 	flag.BoolVar(&migrationContext.AllowChildForeignKeys, "allow-child-foreign-keys", false, "Allow gh-ost to create foreign keys on the ghost table when the child table has foreign keys")
 	flag.StringVar(&migrationContext.ForeignKeyRenamePrefix, "foreign-key-rename-prefix", "_", "Rename foreign keys in the ghost table by adding this prefix")
+
+	flag.BoolVar(&migrationContext.AcceptHighRiskOrphanedForeignKeys, "accept-high-risk-orphaned-foreign-keys", false, "DANGER! VERY DANGEROUS! Allow gh-ost to create foreign keys on the ghost table when the child table has foreign keys")
+	flag.BoolVar(&migrationContext.FKFallbackEnabled, "fk-fallback-enabled", false, "Enable FK fallback: on FK error, query original table and apply via INSERT ON DUPLICATE KEY UPDATE")
+
 	flag.BoolVar(&migrationContext.SkipForeignKeyChecks, "skip-foreign-key-checks", false, "set to 'true' when you know for certain there are no foreign keys on your table, and wish to skip the time it takes for gh-ost to verify that")
 	flag.BoolVar(&migrationContext.SkipStrictMode, "skip-strict-mode", false, "explicitly tell gh-ost binlog applier not to enforce strict sql mode")
 	flag.BoolVar(&migrationContext.AllowZeroInDate, "allow-zero-in-date", false, "explicitly tell gh-ost binlog applier to ignore NO_ZERO_IN_DATE,NO_ZERO_DATE in sql_mode")
